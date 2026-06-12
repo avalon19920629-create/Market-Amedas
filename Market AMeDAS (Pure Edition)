@@ -6,10 +6,13 @@
 # Colabで日本語フォントが必要な場合は、ノートブック上で下記を別セル実行:
 # !pip install -q japanize-matplotlib
 
+import json
+import math
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
@@ -216,6 +219,154 @@ def analyze_weather_map_v5():
 
     return season_pressure, net_ratio, legacy_power_ratio, low_pressure, is_storm, btc_w, detailed_assets, atm_conditions
 
+SEASON_JSON_KEYS = {
+    "Spring": "growth",
+    "Autumn": "yield",
+    "Winter": "defense",
+    "Summer": "inflation",
+}
+
+ASSET_JSON_KEYS = {
+    "ナスダック": "nasdaq", "バリュー": "value", "小型株": "small_cap",
+    "ジャンク": "junk_bond", "先進国": "developed_equity", "米国株": "us_equity",
+    "REIT": "reit", "社債": "corporate_bond", "高配当": "high_dividend",
+    "長期債": "long_bond", "物価連動": "tips", "新興国": "emerging_equity",
+    "商品": "commodity", "金": "gold", "BTC": "btc", "現金": "cash",
+    "米ドル": "usd",
+}
+
+
+def _json_safe(value):
+    """JSONに保存できるPython標準型へ再帰的に変換する。"""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    return value
+
+
+def _build_flow_entry(asset):
+    name = asset.get("Name")
+    season = asset.get("Season")
+    return {
+        "asset": ASSET_JSON_KEYS.get(name, str(asset.get("Ticker", "unknown")).lower().replace("-", "_")),
+        "label": name,
+        "ticker": asset.get("Ticker"),
+        "air_mass": SEASON_JSON_KEYS.get(season),
+        "score": asset.get("Score"),
+    }
+
+
+def build_market_amedas_snapshot(
+    season_pressure, net_ratio, legacy_power_ratio, btc_w, atm_conditions,
+    detailed_assets, updrafts, downdrafts, is_storm, generated_at,
+):
+    """既存の計算済み観測値から機械可読スナップショットを構築する。"""
+    air_mass_order = ["growth", "yield", "defense", "inflation"]
+    source_seasons = {json_key: season for season, json_key in SEASON_JSON_KEYS.items()}
+
+    net_air_mass = {}
+    for json_key in air_mass_order:
+        season = source_seasons[json_key]
+        pressure = season_pressure.get(season, {})
+        negative = pressure.get("negative", 0.0)
+        net_air_mass[json_key] = {
+            "label": labels[season],
+            "updraft_pressure": pressure.get("positive", 0.0),
+            "downdraft_pressure": -abs(negative),
+            "net_pressure": pressure.get("net", 0.0),
+            "share_pct": net_ratio.get(season, 0.0),
+            "classification": classify_net_pressure(pressure.get("net", 0.0)),
+        }
+
+    ranked_air_masses = sorted(
+        air_mass_order,
+        key=lambda key: (-net_air_mass[key]["net_pressure"], air_mass_order.index(key)),
+    )
+    market_warnings = []
+    if is_storm:
+        market_warnings.append("vix_storm_warning")
+    if net_air_mass["inflation"]["net_pressure"] < -0.30:
+        market_warnings.append("inflation_air_mass_negative")
+    if all(net_air_mass[key]["net_pressure"] < 0 for key in air_mass_order):
+        market_warnings.append("all_air_masses_negative")
+
+    btc_risk_on = btc_w.get("Spring", 0.0) > 0.5
+    btc_in_downdrafts = any(
+        asset.get("Ticker") == "BTC-USD" or asset.get("Name") == "BTC"
+        for asset in downdrafts
+    )
+    if btc_risk_on and btc_in_downdrafts:
+        market_warnings.append("btc_downdraft_under_risk_on_sensor")
+
+    observed_tickers = {asset.get("Ticker") for asset in detailed_assets}
+    missing_tickers = sorted(set(assets) - observed_tickers)
+    data_warnings = []
+    if missing_tickers:
+        data_warnings.append({"code": "missing_assets", "tickers": missing_tickers})
+
+    wind, oxygen, ground = atm_conditions
+    snapshot = {
+        "schema_version": "market_amedas_snapshot.v1",
+        "generated_at": generated_at,
+        "source": {
+            "system": "Market Amedas PURE",
+            "version": "v5.1 compat",
+            "stage": "Stage3-F Net Air Mass",
+            "market_data_provider": "yfinance",
+        },
+        "data_status": {
+            "status": "complete" if not data_warnings else "unknown_or_partial",
+            "warnings": data_warnings,
+        },
+        "regime": {
+            "net_air_mass": net_air_mass,
+            "positive_only_ratio": {
+                json_key: legacy_power_ratio.get(source_seasons[json_key], 0.0)
+                for json_key in air_mass_order
+            },
+            "dominant_air_mass": ranked_air_masses[0],
+            "secondary_air_mass": ranked_air_masses[1],
+        },
+        "btc_sensor": {
+            "mode": "risk_on" if btc_risk_on else "digital_gold",
+            "label": "リスクオン (Spring)" if btc_risk_on else "デジタルゴールド (Summer)",
+            "weights": {
+                "growth": btc_w.get("Spring", 0.0),
+                "inflation": btc_w.get("Summer", 0.0),
+            },
+        },
+        "atmospheric_conditions": {
+            "usd": {"display": wind},
+            "junk_bond": {"display": oxygen},
+            "small_cap": {"display": ground},
+        },
+        "flows": {
+            "updrafts": [_build_flow_entry(asset) for asset in updrafts],
+            "downdrafts": [_build_flow_entry(asset) for asset in downdrafts],
+        },
+        "market_warnings": market_warnings,
+    }
+    return _json_safe(snapshot)
+
+
+def write_market_amedas_snapshot(snapshot, output_path="market_amedas_snapshot.json"):
+    """スナップショットを保存する。失敗時も既存レポート処理を妨げない。"""
+    try:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            json.dump(_json_safe(snapshot), output_file, ensure_ascii=False, allow_nan=False, indent=2)
+            output_file.write("\n")
+        return True
+    except Exception:
+        return False
+
+
 def calculate_rsi(series, window=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -312,6 +463,16 @@ if __name__ == "__main__":
         sorted_assets = sorted(detailed_assets, key=lambda x: x['Score'], reverse=True)
         updrafts = [a for a in sorted_assets if a['Score'] > EPSILON and a['Season'] != "Env"]
         downdrafts = [a for a in sorted_assets if a['Score'] < -EPSILON and a['Season'] != "Env"]
+
+        try:
+            snapshot = build_market_amedas_snapshot(
+                season_pressure, net_ratio, legacy_power_ratio, btc_w, atm_conditions,
+                detailed_assets, updrafts, downdrafts, is_storm,
+                datetime.now(timezone.utc).isoformat(),
+            )
+            write_market_amedas_snapshot(snapshot)
+        except Exception:
+            pass
 
         print("\n📈 [上昇流 - Updrafts]")
         if updrafts:
