@@ -1,0 +1,333 @@
+# 国際市場観測システム（Market AMeDAS）- Pure Edition
+# Stage3-F compatibility patch
+# 目的: 元のPURE版のデータ取得・モメンタム計算を維持し、気団集計だけを
+#       positive / negative / net に差し替える。
+
+# Colabで日本語フォントが必要な場合は、ノートブック上で下記を別セル実行:
+# !pip install -q japanize-matplotlib
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    import japanize_matplotlib  # noqa: F401
+except ImportError:
+    pass
+plt.rcParams["axes.unicode_minus"] = False
+
+# ==========================================================
+# 0. 思想定義：Market Weather Map Philosophy v5.1
+# ==========================================================
+# 1. これは暦ではない。天気図である。
+# 2. 「天気（価格）」だけでなく「大気の状態（環境）」も観測する。
+# 3. ドルは風、ジャンク債は酸素、小型株は地熱である。
+# 4. 気団は勝者だけを表示しない。上昇流・下降流・正味圧力で観測する。
+
+# ==========================================================
+# 1. 資産定義と属性ウェイト
+# ==========================================================
+asset_weights_template = {
+    "SPY": {"Spring": 1.0}, "VEA": {"Spring": 1.0}, "VWO": {"Spring": 1.0}, "QQQ": {"Spring": 1.0},
+    "IWM": {"Spring": 1.0},
+    "DBC": {"Summer": 1.0}, "GLD": {"Summer": 1.0}, "TIP": {"Summer": 1.0},
+    "IYR": {"Autumn": 1.0}, "LQD": {"Autumn": 1.0}, "VYM": {"Autumn": 1.0}, "VTV": {"Autumn": 1.0},
+    "HYG": {"Autumn": 1.0},
+    "TLT": {"Winter": 1.0}, "SHV": {"Winter": 1.0}
+}
+
+sensor_tickers = ["UUP"]
+
+assets = {
+    "SPY": "米国株", "VEA": "先進国", "VWO": "新興国", "QQQ": "ナスダック",
+    "IWM": "小型株", "BTC-USD": "BTC",
+    "DBC": "商品", "GLD": "金", "TIP": "物価連動",
+    "IYR": "REIT", "LQD": "社債", "VYM": "高配当", "VTV": "バリュー",
+    "HYG": "ジャンク", "TLT": "長期債", "SHV": "現金", "UUP": "米ドル"
+}
+env_tickers = {"^TNX": "米10年債利回り", "^VIX": "VIX指数"}
+
+seasons = ["Spring", "Summer", "Autumn", "Winter"]
+labels = {"Spring": "成長気団", "Summer": "インフレ気団", "Autumn": "利回り気団", "Winter": "防衛気団"}
+
+EPSILON = 0.005
+
+# ==========================================================
+# 2. ロジック・エンジン v5.1 compat
+# ==========================================================
+def get_btc_climate_weights(vix, yield_trend):
+    if vix < 20 and yield_trend < 0.1: return {"Spring": 0.8, "Summer": 0.2}
+    elif vix > 25 or yield_trend > 0.2: return {"Spring": 0.2, "Summer": 0.8}
+    else: return {"Spring": 0.5, "Summer": 0.5}
+
+def get_weather_icon(pressure_score):
+    if pressure_score < 0.3: return "☀️"
+    elif pressure_score < 0.8: return "☁️"
+    elif pressure_score < 1.5: return "☂️"
+    else: return "⛈️"
+
+def get_contribution_label(contrib_score, total_season_power):
+    if total_season_power <= 0: return "・"
+    share = (contrib_score / total_season_power) * 100
+    if share > 40: return "★主導"
+    elif share > 15: return "●支え"
+    else: return "・補完"
+
+def classify_net_pressure(net):
+    if net > 0.30:
+        return "上昇優勢"
+    if net > 0.05:
+        return "小幅上昇"
+    if net < -0.30:
+        return "下降優勢"
+    if net < -0.05:
+        return "小幅下降"
+    return "中立"
+
+def analyze_atmosphere(asset_stats):
+    uup = asset_stats.get("UUP", {}).get("Score", 0)
+    hyg = asset_stats.get("HYG", {}).get("Score", 0)
+    iwm = asset_stats.get("IWM", {}).get("Score", 0)
+    spy = asset_stats.get("SPY", {}).get("Score", 0)
+
+    if uup > 0.5: wind_status = "🌬️ 向かい風 (ドル高による圧力)"
+    elif uup < -0.5: wind_status = "🍃 追い風 (ドル安による支援)"
+    else: wind_status = "🏳️ 凪 (影響なし)"
+
+    if hyg > 0 and spy > 0: oxygen_status = "🟢 正常 (健全な上昇)"
+    elif hyg < 0 and spy > 0: oxygen_status = "⚠️ 酸欠 (株高だが債務懸念あり・ダイバージェンス)"
+    elif hyg < 0 and spy < 0: oxygen_status = "🔴 窒息 (信用収縮中)"
+    else: oxygen_status = "⚪ 中立"
+
+    if iwm > 0 and spy > 0: ground_status = "🔥 温暖 (景気回復は本物)"
+    elif iwm < 0 and spy > 0: ground_status = "🧊 冷え込み (大企業のみ浮かれている)"
+    else: ground_status = "⚪ 観測不能"
+
+    return wind_status, oxygen_status, ground_status
+
+def analyze_weather_map_v5():
+    print("📡 Market Weather Map v5.1 compat: アメダス観測データを収集中...")
+
+    all_tickers = list(assets.keys()) + list(env_tickers.keys())
+    # 互換性重視: 元PURE版と同じ重複除去方式を維持。
+    all_tickers = list(set(all_tickers))
+
+    end = datetime.today()
+    start = end - timedelta(days=400)
+    try:
+        # 互換性重視: 元PURE版と同じ yf.download / ffill / bfill を維持。
+        data = yf.download(all_tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+        data = data.ffill().bfill()
+    except Exception as e:
+        print(f"データ取得エラー: {e}")
+        return None
+
+    yield_trend = data["^TNX"].iloc[-1] - data["^TNX"].iloc[-21]
+    vix = data["^VIX"].iloc[-1]
+
+    btc_w = get_btc_climate_weights(vix, yield_trend)
+    current_asset_weights = asset_weights_template.copy()
+    current_asset_weights["BTC-USD"] = btc_w
+
+    raw_stats = {}
+    for t in assets.keys():
+        try:
+            p = data[t]
+            # 互換性重視: 元PURE版と同じ iloc[-21/-63/-126] 計算を維持。
+            mom = ((p.iloc[-1]/p.iloc[-21]-1)*12 + (p.iloc[-1]/p.iloc[-63]-1)*4 + (p.iloc[-1]/p.iloc[-126]-1)*2)/18
+            vol = p.pct_change().std() * np.sqrt(252)
+            score = mom / vol if vol > 0.01 else 0
+            raw_stats[t] = score
+        except Exception:
+            continue
+
+    # Stage3-F: 気団集計を positive / negative / net の三層に変更。
+    season_pressure = {
+        s: {"positive": 0.0, "negative": 0.0, "net": 0.0, "legacy_positive": 0.0}
+        for s in seasons
+    }
+    low_pressure = {s: 0.0 for s in seasons}
+    detailed_assets = []
+
+    for t, score in raw_stats.items():
+        if t in sensor_tickers:
+            continue
+
+        weights = current_asset_weights.get(t, {})
+        main_season = max(weights, key=weights.get) if weights else "None"
+
+        contrib_val = 0.0
+        if score > 0:
+            for s, w in weights.items():
+                val = score * w
+                season_pressure[s]["positive"] += val
+                season_pressure[s]["legacy_positive"] += val
+                if s == main_season:
+                    contrib_val = val
+        else:
+            for s, w in weights.items():
+                val = abs(score) * w
+                season_pressure[s]["negative"] += val
+                low_pressure[s] += val
+
+        detailed_assets.append({
+            "Name": assets[t], "Ticker": t, "Score": score, "Season": main_season, "Contrib_Val": contrib_val
+        })
+
+    for t in sensor_tickers:
+        if t in raw_stats:
+            detailed_assets.append({"Name": assets[t], "Ticker": t, "Score": raw_stats[t], "Season": "Env", "Contrib_Val": 0})
+
+    is_storm = False
+    if vix > 25:
+        is_storm = True
+        season_pressure["Winter"]["positive"] += 2.0
+        season_pressure["Winter"]["legacy_positive"] += 2.0
+
+    spy = raw_stats.get("SPY", 0)
+    shv = raw_stats.get("SHV", 0)
+    if spy < 0 and shv > spy:
+        winter_boost = (shv - spy) * 2.0
+        season_pressure["Winter"]["positive"] += winter_boost
+        season_pressure["Winter"]["legacy_positive"] += winter_boost
+
+    for s in seasons:
+        season_pressure[s]["net"] = season_pressure[s]["positive"] - season_pressure[s]["negative"]
+
+    # 旧表示との比較用: 元PURE版と同じ正スコアのみ比率。
+    legacy_total = sum(season_pressure[s]["legacy_positive"] for s in seasons)
+    if legacy_total <= 0:
+        legacy_power_ratio = {s: 0.0 for s in seasons}
+    else:
+        legacy_power_ratio = {s: (season_pressure[s]["legacy_positive"] / legacy_total) * 100 for s in seasons}
+
+    # 新表示: 正味圧力を絶対値総量で割る。正負が残るので相殺が見える。
+    net_total_abs = sum(abs(season_pressure[s]["net"]) for s in seasons)
+    if net_total_abs <= 0:
+        net_ratio = {s: 0.0 for s in seasons}
+    else:
+        net_ratio = {s: (season_pressure[s]["net"] / net_total_abs) * 100 for s in seasons}
+
+    atm_conditions = analyze_atmosphere({t: {"Score": s} for t, s in raw_stats.items()})
+
+    return season_pressure, net_ratio, legacy_power_ratio, low_pressure, is_storm, btc_w, detailed_assets, atm_conditions
+
+def calculate_rsi(series, window=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def plot_net_pressure_distribution(season_pressure):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    centers = {"Spring": 1.0, "Summer": 2.2, "Autumn": 3.4, "Winter": 4.6}
+    colors = {"Spring": "#90EE90", "Summer": "#FF6347", "Autumn": "#FFA500", "Winter": "#87CEFA"}
+    x = np.linspace(0, 5.6, 800)
+    sigma = 0.48
+    total_net_curve = np.zeros_like(x)
+
+    for s in seasons:
+        pos = season_pressure[s]["positive"]
+        neg = season_pressure[s]["negative"]
+        net = season_pressure[s]["net"]
+        center = centers[s]
+
+        if pos > EPSILON:
+            y_pos = pos * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+            ax.fill_between(x, 0, y_pos, alpha=0.28, color=colors[s])
+            ax.plot(x, y_pos, color=colors[s], linewidth=2)
+        if neg > EPSILON:
+            y_neg = -neg * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+            ax.fill_between(x, 0, y_neg, alpha=0.18, color=colors[s])
+            ax.plot(x, y_neg, color=colors[s], linewidth=1.5, linestyle=":")
+
+        total_net_curve += net * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+
+        ax.plot([], [], color=colors[s], linewidth=2, label=f"{labels[s]} 正味 {net:+.2f}")
+
+    ax.plot(x, total_net_curve, color="black", linewidth=2.5, linestyle="--", label="総合正味気圧場")
+    ax.axhline(0, color="black", linewidth=0.8)
+
+    ax.set_title("市場気団 正味圧力分布図")
+    ax.set_xlabel("市場レジーム空間")
+    ax.set_ylabel("正味圧力")
+    ax.set_xticks([centers[s] for s in seasons])
+    ax.set_xticklabels(["成長", "インフレ", "利回り", "防衛"])
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================================
+# 3. 統合実行セクション
+# ==========================================================
+if __name__ == "__main__":
+    res = analyze_weather_map_v5()
+    if res:
+        season_pressure, net_ratio, legacy_power_ratio, low_pressure, is_storm, btc_w, detailed_assets, atm_conditions = res
+        wind, oxygen, ground = atm_conditions
+
+        print("\n" + "="*72)
+        print("📡 Market Weather Map v5.1 compat (Stage3-F Net Air Mass)")
+        print("="*72)
+        print("【現在の市場気圧配置：上昇流 / 下降流 / 正味圧力】")
+
+        sorted_net = sorted(seasons, key=lambda s: season_pressure[s]["net"], reverse=True)
+        for s in sorted_net:
+            pos = season_pressure[s]["positive"]
+            neg = season_pressure[s]["negative"]
+            net = season_pressure[s]["net"]
+            ratio = net_ratio[s]
+            icon = get_weather_icon(neg)
+            state = classify_net_pressure(net)
+            arrow = "▲" * int(max(ratio, 0) // 3) if ratio > 0 else "▼" * int(abs(min(ratio, 0)) // 3)
+            print(f"{icon} {labels[s]:<10} : 上昇 {pos:+6.2f} / 下降 {-neg:+6.2f} / 正味 {net:+6.2f} ({ratio:+6.1f}%) {arrow} [{state}]")
+
+        print("-" * 72)
+        print("【旧ロジック互換表示：正スコアのみ比率】")
+        for s, ratio in sorted(legacy_power_ratio.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {labels[s]:<10} : {ratio:5.1f}%")
+
+        print("-" * 72)
+        if is_storm:
+            print("⛈️ 【警報】暴風域 (VIX > 25) 発生中。防衛気団が支配的です。")
+        btc_mode = "リスクオン (Spring)" if btc_w['Spring'] > 0.5 else "デジタルゴールド (Summer)"
+        print(f"📡 BTCセンサー感応 : [{btc_mode}] モード")
+
+        print("\n" + "="*72)
+        print("🌡️ 気象条件 (Atmospheric Conditions)")
+        print("="*72)
+        print(f"1. 風向き (米ドル)    : {wind}")
+        print(f"2. 酸素濃度 (ジャンク): {oxygen}")
+        print(f"3. 地熱 (小型株)      : {ground}")
+        print("-" * 72)
+
+        print("\n📋 構造分析ログ")
+        sorted_assets = sorted(detailed_assets, key=lambda x: x['Score'], reverse=True)
+        updrafts = [a for a in sorted_assets if a['Score'] > EPSILON and a['Season'] != "Env"]
+        downdrafts = [a for a in sorted_assets if a['Score'] < -EPSILON and a['Season'] != "Env"]
+
+        print("\n📈 [上昇流 - Updrafts]")
+        if updrafts:
+            for a in updrafts:
+                s_name = labels.get(a['Season'], "その他")[:2]
+                role = get_contribution_label(a['Contrib_Val'], season_pressure.get(a['Season'], {}).get("positive", 1))
+                print(f"  {role} {a['Name']:<6} [{s_name}] : +{a['Score']:.2f}")
+        else:
+            print("  なし")
+
+        print("\n📉 [下降流 - Downdrafts]")
+        if downdrafts:
+            for a in downdrafts:
+                s_name = labels.get(a['Season'], "その他")[:2]
+                print(f"  ・崩し {a['Name']:<6} [{s_name}] : {a['Score']:.2f}")
+        else:
+            print("  なし")
+
+        plot_net_pressure_distribution(season_pressure)
