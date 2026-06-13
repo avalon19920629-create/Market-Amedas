@@ -96,3 +96,47 @@ def test_writer_emits_utf8_standard_json_without_nonfinite_values(tmp_path, caps
 def test_writer_failure_is_non_fatal(tmp_path, capsys):
     assert MODULE["write_market_amedas_snapshot"]({}, tmp_path) is False
     assert capsys.readouterr().out == ""
+
+
+def test_cli_runner_creates_output_directory_and_copies_valid_snapshot(tmp_path):
+    import subprocess
+
+    import run_market_amedas
+
+    output_dir = tmp_path / "nested" / "artifacts"
+
+    def fake_command_runner(command, cwd):
+        assert command == [sys.executable, str(run_market_amedas.SOURCE_FILE)]
+        snapshot = {
+            "schema_version": "market_amedas_snapshot.v1",
+            "label": "成長気団",
+        }
+        (Path(cwd) / "market_amedas_snapshot.json").write_text(
+            json.dumps(snapshot, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    assert run_market_amedas.main(
+        ["--output-dir", str(output_dir)], command_runner=fake_command_runner
+    ) == 0
+
+    output_path = output_dir / "market_amedas_snapshot.json"
+    assert output_path.is_file()
+    assert json.loads(output_path.read_text(encoding="utf-8"))["schema_version"] == (
+        "market_amedas_snapshot.v1"
+    )
+
+
+def test_cli_runner_reports_missing_snapshot(tmp_path, capsys):
+    import subprocess
+
+    import run_market_amedas
+
+    def fake_command_runner(command, cwd):
+        return subprocess.CompletedProcess(command, 0)
+
+    assert run_market_amedas.main(
+        ["--output-dir", str(tmp_path)], command_runner=fake_command_runner
+    ) == 1
+    assert "market_amedas_snapshot.json を生成しませんでした" in capsys.readouterr().err
